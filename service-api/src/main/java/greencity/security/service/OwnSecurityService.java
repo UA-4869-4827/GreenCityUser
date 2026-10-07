@@ -40,6 +40,8 @@ public interface OwnSecurityService {
      */
     SuccessSignInDto signIn(OwnSignInDto dto);
 
+    SuccessSignInDto signInWithGoogle(String idToken);
+
     /**
      * Method that update your access token by refresh token.
      *
