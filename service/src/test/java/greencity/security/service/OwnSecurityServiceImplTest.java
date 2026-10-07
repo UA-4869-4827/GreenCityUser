@@ -1,5 +1,6 @@
 package greencity.security.service;
 
+import com.google.api.client.googleapis.auth.oauth2.GoogleIdToken;
 import greencity.TestConst;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -38,6 +39,7 @@ import greencity.exception.exceptions.UserDeactivatedException;
 import greencity.exception.exceptions.WrongEmailException;
 import greencity.exception.exceptions.WrongPasswordException;
 import greencity.repository.UserRepo;
+import greencity.security.dto.SuccessSignInDto;
 import greencity.security.dto.ownsecurity.EmployeeSignUpDto;
 import greencity.security.dto.ownsecurity.OwnSignInDto;
 import greencity.security.dto.ownsecurity.OwnSignUpDto;
@@ -49,6 +51,7 @@ import greencity.security.repository.RestorePasswordEmailRepo;
 import greencity.service.EmailService;
 import greencity.service.UserService;
 import io.jsonwebtoken.ExpiredJwtException;
+import com.google.api.client.googleapis.auth.oauth2.GoogleIdTokenVerifier;
 
 import java.time.LocalDateTime;
 import java.util.Optional;
@@ -63,6 +66,17 @@ import org.mockito.quality.Strictness;
 import org.modelmapper.ModelMapper;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import java.io.IOException;
+import java.security.GeneralSecurityException;
+import greencity.exception.exceptions.BadRequestException;
+import static org.mockito.Mockito.never;
+import greencity.constant.AppConstant;
+import greencity.security.dto.SuccessSignInDto;
+import org.mockito.ArgumentCaptor;
+
+import static org.mockito.ArgumentCaptor.forClass;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
@@ -92,6 +106,15 @@ class OwnSecurityServiceImplTest {
     @Mock
     EmailService emailService;
 
+    @Mock
+    GoogleIdTokenVerifier googleIdTokenVerifier;
+
+    @Mock
+    private GoogleIdToken googleIdToken;
+
+    @Mock
+    private GoogleIdToken.Payload googlePayload;
+
     private OwnSecurityService ownSecurityService;
 
     private UserVO verifiedUser;
@@ -100,12 +123,21 @@ class OwnSecurityServiceImplTest {
     private UpdatePasswordDto updatePasswordDto;
     private UserManagementDto userManagementDto;
 
+    private void mockVerifiedGoogleToken(String email, Object name)
+            throws GeneralSecurityException, IOException {
+        when(googleIdTokenVerifier.verify("valid-token")).thenReturn(googleIdToken);
+        when(googleIdToken.getPayload()).thenReturn(googlePayload);
+        when(googlePayload.getEmail()).thenReturn(email);
+        when(googlePayload.getEmailVerified()).thenReturn(true);
+        when(googlePayload.get("name")).thenReturn(name);
+    }
+
     @BeforeEach
     public void init() {
         initMocks(this);
         ownSecurityService = new OwnSecurityServiceImpl(ownSecurityRepo, userService, passwordEncoder,
             jwtTool, 1, restorePasswordEmailRepo, modelMapper,
-            userRepo, emailService);
+            userRepo, emailService, googleIdTokenVerifier);
 
         verifiedUser = UserVO.builder()
             .email("test@gmail.com")
@@ -181,6 +213,249 @@ class OwnSecurityServiceImplTest {
         verify(jwtTool, times(1)).createAccessToken(anyString(), any(Role.class));
         verify(jwtTool, times(1)).createRefreshToken(any(UserVO.class));
     }
+
+    @Test
+    void signInWithGoogleRejectsInvalidToken() throws GeneralSecurityException, IOException {
+        when(googleIdTokenVerifier.verify("invalid-token")).thenReturn(null);
+
+        assertThrows(
+                BadRequestException.class,
+                () -> ownSecurityService.signInWithGoogle("invalid-token")
+        );
+
+        verify(userService, never()).findByEmail(anyString());
+    }
+
+    @Test
+    void signInWithGoogleRejectsUnverifiedEmail() throws GeneralSecurityException, IOException {
+        when(googleIdTokenVerifier.verify("valid-token")).thenReturn(googleIdToken);
+        when(googleIdToken.getPayload()).thenReturn(googlePayload);
+        when(googlePayload.getEmail()).thenReturn("test@gmail.com");
+        when(googlePayload.getEmailVerified()).thenReturn(false);
+
+        assertThrows(
+                BadRequestException.class,
+                () -> ownSecurityService.signInWithGoogle("valid-token")
+        );
+
+        verify(userService, never()).findByEmail(anyString());
+    }
+
+    @Test
+    void signInWithGoogleReturnsTokensForExistingUser() throws GeneralSecurityException, IOException {
+        when(googleIdTokenVerifier.verify("valid-token")).thenReturn(googleIdToken);
+        when(googleIdToken.getPayload()).thenReturn(googlePayload);
+        when(googlePayload.getEmail()).thenReturn("test@gmail.com");
+        when(googlePayload.getEmailVerified()).thenReturn(true);
+        when(userService.findByEmail("test@gmail.com")).thenReturn(verifiedUser);
+        when(jwtTool.createAccessToken("test@gmail.com", Role.ROLE_USER))
+                .thenReturn("access-token");
+        when(jwtTool.createRefreshToken(verifiedUser))
+                .thenReturn("refresh-token");
+
+        SuccessSignInDto result = ownSecurityService.signInWithGoogle("valid-token");
+
+        assertEquals(1L, result.getUserId());
+        assertEquals("access-token", result.getAccessToken());
+        assertEquals("refresh-token", result.getRefreshToken());
+
+        verify(userRepo, never()).save(any(User.class));
+        verify(jwtTool).createAccessToken("test@gmail.com", Role.ROLE_USER);
+        verify(jwtTool).createRefreshToken(verifiedUser);
+    }
+
+    @Test
+    void signInWithGoogleCreatesUserAndReturnsTokens() throws GeneralSecurityException, IOException {
+        String email = "new.user@gmail.com";
+
+        when(googleIdTokenVerifier.verify("valid-token")).thenReturn(googleIdToken);
+        when(googleIdToken.getPayload()).thenReturn(googlePayload);
+        when(googlePayload.getEmail()).thenReturn(email);
+        when(googlePayload.getEmailVerified()).thenReturn(true);
+        when(googlePayload.get("name")).thenReturn("New User");
+        when(userService.findByEmail(email)).thenReturn(null);
+
+        when(jwtTool.generateTokenKey()).thenReturn("refresh-key");
+        when(modelMapper.map(AppConstant.DEFAULT_LANGUAGE_CODE, Long.class)).thenReturn(2L);
+
+        User savedUser = User.builder()
+                .id(2L)
+                .name("New User")
+                .email(email)
+                .role(Role.ROLE_USER)
+                .userStatus(UserStatus.ACTIVATED)
+                .refreshTokenKey("refresh-key")
+                .build();
+
+        UserVO newUserVO = UserVO.builder()
+                .id(2L)
+                .name("New User")
+                .email(email)
+                .role(Role.ROLE_USER)
+                .userStatus(UserStatus.ACTIVATED)
+                .refreshTokenKey("refresh-key")
+                .build();
+
+        when(userRepo.save(any(User.class))).thenReturn(savedUser);
+        when(modelMapper.map(savedUser, UserVO.class)).thenReturn(newUserVO);
+        when(jwtTool.createAccessToken(email, Role.ROLE_USER)).thenReturn("access-token");
+        when(jwtTool.createRefreshToken(newUserVO)).thenReturn("refresh-token");
+
+        SuccessSignInDto result = ownSecurityService.signInWithGoogle("valid-token");
+
+        assertEquals(2L, result.getUserId());
+        assertEquals("access-token", result.getAccessToken());
+        assertEquals("refresh-token", result.getRefreshToken());
+
+        ArgumentCaptor<User> userCaptor = forClass(User.class);
+        verify(userRepo).save(userCaptor.capture());
+
+        User createdUser = userCaptor.getValue();
+        assertEquals(email, createdUser.getEmail());
+        assertEquals("New User", createdUser.getName());
+        assertEquals(Role.ROLE_USER, createdUser.getRole());
+        assertEquals(UserStatus.ACTIVATED, createdUser.getUserStatus());
+        assertEquals("refresh-key", createdUser.getRefreshTokenKey());
+        assertEquals(2L, createdUser.getLanguage().getId());
+        assertNotNull(createdUser.getUuid());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = UserStatus.class, names = {"BLOCKED", "DEACTIVATED", "CREATED"})
+    void signInWithGoogleRejectsInactiveUser(UserStatus status)
+            throws GeneralSecurityException, IOException {
+        String email = "test@gmail.com";
+
+        when(googleIdTokenVerifier.verify("valid-token")).thenReturn(googleIdToken);
+        when(googleIdToken.getPayload()).thenReturn(googlePayload);
+        when(googlePayload.getEmail()).thenReturn(email);
+        when(googlePayload.getEmailVerified()).thenReturn(true);
+
+        UserVO user = UserVO.builder()
+                .id(1L)
+                .email(email)
+                .role(Role.ROLE_USER)
+                .userStatus(status)
+                .build();
+        when(userService.findByEmail(email)).thenReturn(user);
+
+        assertThrows(
+                BadUserStatusException.class,
+                () -> ownSecurityService.signInWithGoogle("valid-token")
+        );
+
+        verify(jwtTool, never()).createAccessToken(anyString(), any(Role.class));
+        verify(jwtTool, never()).createRefreshToken(any(UserVO.class));
+        verify(userRepo, never()).save(any(User.class));
+    }
+
+    @Test
+    void signInWithGoogleUsesEmailAsNameWhenGoogleNameIsMissing()
+            throws GeneralSecurityException, IOException {
+        String email = "new.user@gmail.com";
+        mockVerifiedGoogleToken(email, null);
+        when(userService.findByEmail(email)).thenReturn(null);
+        when(jwtTool.generateTokenKey()).thenReturn("refresh-key");
+        when(modelMapper.map(AppConstant.DEFAULT_LANGUAGE_CODE, Long.class)).thenReturn(2L);
+
+        User savedUser = User.builder()
+                .id(2L)
+                .name("new.user")
+                .email(email)
+                .role(Role.ROLE_USER)
+                .userStatus(UserStatus.ACTIVATED)
+                .refreshTokenKey("refresh-key")
+                .build();
+        UserVO savedUserVO = UserVO.builder()
+                .id(2L)
+                .name("new.user")
+                .email(email)
+                .role(Role.ROLE_USER)
+                .userStatus(UserStatus.ACTIVATED)
+                .refreshTokenKey("refresh-key")
+                .build();
+
+        when(userRepo.save(any(User.class))).thenReturn(savedUser);
+        when(modelMapper.map(savedUser, UserVO.class)).thenReturn(savedUserVO);
+        when(jwtTool.createAccessToken(email, Role.ROLE_USER)).thenReturn("access-token");
+        when(jwtTool.createRefreshToken(savedUserVO)).thenReturn("refresh-token");
+
+        ownSecurityService.signInWithGoogle("valid-token");
+
+        ArgumentCaptor<User> captor = ArgumentCaptor.forClass(User.class);
+        verify(userRepo).save(captor.capture());
+        assertEquals("new.user", captor.getValue().getName());
+    }
+
+    @Test
+    void signInWithGoogleUsesEmailAsNameWhenGoogleNameIsNotString()
+            throws GeneralSecurityException, IOException {
+        String email = "new.user@gmail.com";
+        mockVerifiedGoogleToken(email, 123);
+        when(userService.findByEmail(email)).thenReturn(null);
+        when(jwtTool.generateTokenKey()).thenReturn("refresh-key");
+        when(modelMapper.map(AppConstant.DEFAULT_LANGUAGE_CODE, Long.class)).thenReturn(2L);
+
+        User savedUser = User.builder()
+                .id(2L)
+                .name("new.user")
+                .email(email)
+                .role(Role.ROLE_USER)
+                .userStatus(UserStatus.ACTIVATED)
+                .refreshTokenKey("refresh-key")
+                .build();
+        UserVO savedUserVO = UserVO.builder()
+                .id(2L)
+                .name("new.user")
+                .email(email)
+                .role(Role.ROLE_USER)
+                .userStatus(UserStatus.ACTIVATED)
+                .refreshTokenKey("refresh-key")
+                .build();
+
+        when(userRepo.save(any(User.class))).thenReturn(savedUser);
+        when(modelMapper.map(savedUser, UserVO.class)).thenReturn(savedUserVO);
+        when(jwtTool.createAccessToken(email, Role.ROLE_USER)).thenReturn("access-token");
+        when(jwtTool.createRefreshToken(savedUserVO)).thenReturn("refresh-token");
+
+        ownSecurityService.signInWithGoogle("valid-token");
+
+        ArgumentCaptor<User> captor = ArgumentCaptor.forClass(User.class);
+        verify(userRepo).save(captor.capture());
+        assertEquals("new.user", captor.getValue().getName());
+    }
+
+    @Test
+    void signInWithGoogleRejectsEmailLongerThanDatabaseLimit()
+            throws GeneralSecurityException, IOException {
+        String email = "a".repeat(40) + "@example.com";
+        mockVerifiedGoogleToken(email, "New User");
+
+        assertThrows(
+                BadRequestException.class,
+                () -> ownSecurityService.signInWithGoogle("valid-token")
+        );
+
+        verify(userRepo, never()).save(any(User.class));
+    }
+
+    @Test
+    void signInWithGoogleHandlesEmailAlreadyRegisteredDuringSave()
+            throws GeneralSecurityException, IOException {
+        String email = "new.user@gmail.com";
+        mockVerifiedGoogleToken(email, "New User");
+        when(userService.findByEmail(email)).thenReturn(null);
+        when(jwtTool.generateTokenKey()).thenReturn("refresh-key");
+        when(modelMapper.map(AppConstant.DEFAULT_LANGUAGE_CODE, Long.class)).thenReturn(2L);
+        when(userRepo.save(any(User.class)))
+                .thenThrow(new DataIntegrityViolationException("Duplicate email"));
+
+        assertThrows(
+                UserAlreadyRegisteredException.class,
+                () -> ownSecurityService.signInWithGoogle("valid-token")
+        );
+    }
+
 
     @Test
     void signInNotVerifiedUser() {

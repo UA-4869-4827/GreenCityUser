@@ -1,5 +1,7 @@
 package greencity.security.service;
 
+import com.google.api.client.googleapis.auth.oauth2.GoogleIdToken;
+import com.google.api.client.googleapis.auth.oauth2.GoogleIdTokenVerifier;
 import greencity.constant.AppConstant;
 import greencity.constant.ErrorMessage;
 import greencity.dto.user.UserAdminRegistrationDto;
@@ -53,6 +55,9 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import java.security.GeneralSecurityException;
+import java.io.IOException;
+import greencity.exception.exceptions.BadRequestException;
 
 /**
  * {@inheritDoc}
@@ -71,6 +76,7 @@ public class OwnSecurityServiceImpl implements OwnSecurityService {
     private static final String VALID_PW_CHARS =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+{}[]|:;<>?,./";
     private final EmailService emailService;
+    private final GoogleIdTokenVerifier  googleIdTokenVerifier;
 
     /**
      * Constructor.
@@ -84,7 +90,8 @@ public class OwnSecurityServiceImpl implements OwnSecurityService {
         RestorePasswordEmailRepo restorePasswordEmailRepo,
         ModelMapper modelMapper,
         UserRepo userRepo,
-        EmailService emailService) {
+        EmailService emailService,
+        GoogleIdTokenVerifier  googleIdTokenVerifier) {
         this.ownSecurityRepo = ownSecurityRepo;
         this.userService = userService;
         this.passwordEncoder = passwordEncoder;
@@ -94,6 +101,7 @@ public class OwnSecurityServiceImpl implements OwnSecurityService {
         this.modelMapper = modelMapper;
         this.userRepo = userRepo;
         this.emailService = emailService;
+        this.googleIdTokenVerifier = googleIdTokenVerifier;
     }
 
     /**
@@ -137,6 +145,7 @@ public class OwnSecurityServiceImpl implements OwnSecurityService {
                 .build())
             .build();
     }
+
 
     private void setUsersFields(OwnSignUpDto dto, User user) {
         OwnSecurity ownSecurity = createOwnSecurity(dto, user);
@@ -233,6 +242,73 @@ public class OwnSecurityServiceImpl implements OwnSecurityService {
             return false;
         }
         return passwordEncoder.matches(signInDto.getPassword(), user.getOwnSecurity().getPassword());
+    }
+    @Transactional
+    @Override
+    public SuccessSignInDto signInWithGoogle(String idToken){
+        if(idToken == null ||  idToken.isBlank()){
+            throw new BadRequestException("Google ID token must not be blank");
+        }
+
+        GoogleIdToken verifiedToken;
+        try{
+            verifiedToken = googleIdTokenVerifier.verify(idToken);
+        }catch (GeneralSecurityException | IOException e){
+            throw new IllegalStateException("Unable to verify Google ID token", e);
+        }
+        if(verifiedToken == null){
+            throw new BadRequestException("Invalid Google ID token");
+        }
+
+        GoogleIdToken.Payload payload = verifiedToken.getPayload();
+        String email = payload.getEmail();
+        if(email == null || email.isBlank()
+        || !Boolean.TRUE.equals(payload.getEmailVerified())){
+            throw new BadRequestException("Google account email is missing or not verified");
+        }
+
+        UserVO user = userService.findByEmail(email);
+        if (user == null) {
+            String name = (String) payload.get("name");
+            if (name == null || name.isBlank()) {
+                name = email.substring(0, email.indexOf('@'));
+            }
+            name = name.substring(0, Math.min(name.length(), 30));
+
+            User newUser = User.builder()
+                    .name(name)
+                    .firstName(name)
+                    .email(email)
+                    .dateOfRegistration(LocalDateTime.now())
+                    .role(Role.ROLE_USER)
+                    .refreshTokenKey(jwtTool.generateTokenKey())
+                    .lastActivityTime(LocalDateTime.now())
+                    .userStatus(UserStatus.ACTIVATED)
+                    .emailNotification(EmailNotification.DISABLED)
+                    .rating(AppConstant.DEFAULT_RATING)
+                    .language(Language.builder()
+                            .id(modelMapper.map(AppConstant.DEFAULT_LANGUAGE_CODE, Long.class))
+                            .build())
+                    .uuid(UUID.randomUUID().toString())
+                    .showLocation(true)
+                    .showEcoPlace(true)
+                    .showShoppingList(true)
+                    .build();
+
+            user = modelMapper.map(userRepo.save(newUser), UserVO.class);
+        }
+        if (user.getUserStatus() == UserStatus.DEACTIVATED) {
+            throw new BadUserStatusException(ErrorMessage.USER_DEACTIVATED);
+        }
+        if (user.getUserStatus() == UserStatus.BLOCKED) {
+            throw new BadUserStatusException(ErrorMessage.USER_BLOCKED);
+        }
+        if (user.getUserStatus() == UserStatus.CREATED) {
+            throw new BadUserStatusException(ErrorMessage.USER_CREATED);
+        }
+        String accessToken = jwtTool.createAccessToken(user.getEmail(), user.getRole());
+        String refreshToken = jwtTool.createRefreshToken(user);
+        return new SuccessSignInDto(user.getId(), accessToken, refreshToken, user.getName(), true);
     }
 
     /**

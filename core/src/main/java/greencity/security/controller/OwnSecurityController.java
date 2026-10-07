@@ -104,6 +104,17 @@ public class OwnSecurityController {
         return ResponseEntity.status(HttpStatus.CREATED).body(service.signUpEmployee(dto, locale.getLanguage()));
     }
 
+    @Operation(summary = "Sign-in by google")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = HttpStatuses.OK,
+                    content = @Content(schema = @Schema(implementation = SuccessSignInDto.class))),
+            @ApiResponse(responseCode = "400", description = HttpStatuses.BAD_REQUEST)
+    })
+    @PostMapping("/signInWithGoogle")
+    public SuccessSignInDto signInWithGoogle(@Valid @RequestBody GoogleAccessTokenDTO dto) {
+        return service.signInWithGoogle(dto.getIdToken());
+    }
+
     /**
      * Method for sign-in by our security logic.
      *

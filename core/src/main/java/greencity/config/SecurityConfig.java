@@ -29,6 +29,7 @@ import static greencity.constant.AppConstant.*;
 import static jakarta.servlet.http.HttpServletResponse.SC_FORBIDDEN;
 import static jakarta.servlet.http.HttpServletResponse.SC_UNAUTHORIZED;
 import static org.springframework.security.config.http.SessionCreationPolicy.STATELESS;
+import org.springframework.beans.factory.annotation.Value;
 
 /**
  * Config for security.
@@ -128,6 +129,7 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST,
                                 "/ownSecurity/signUp",
                                 "/ownSecurity/signIn",
+                                "/ownSecurity/signInWithGoogle",
                                 "/ownSecurity/updatePassword")
                         .permitAll()
                         .requestMatchers(HttpMethod.GET, USER_LINK,
@@ -246,8 +248,11 @@ public class SecurityConfig {
      * Bean {@link GoogleIdTokenVerifier} that uses in verify googleIdToken.
      */
     @Bean
-    public GoogleIdTokenVerifier googleIdTokenVerifier() {
+    public GoogleIdTokenVerifier googleIdTokenVerifier(@Value("${google.clientId}") String googleClientId,
+                                                       @Value("${google.clientId.manager}") String managerClientId){
         return new GoogleIdTokenVerifier.Builder(new NetHttpTransport(),
-                GsonFactory.getDefaultInstance()).build();
+                GsonFactory.getDefaultInstance())
+                .setAudience(Arrays.asList(googleClientId, managerClientId))
+                .build();
     }
 }
